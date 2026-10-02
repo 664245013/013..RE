@@ -10,6 +10,7 @@ from neo4j_service import (
     add_hotel,
     add_person,
     clear_graph_data,
+    get_friends,
     get_hotels,
     get_liked,
     get_metrics,
@@ -19,6 +20,7 @@ from neo4j_service import (
     popular_fallback,
     recommend_hotels,
     seed_demo_data,
+    set_friends,
     set_likes,
     similar_people,
     top_hotels,
@@ -70,8 +72,13 @@ def person_selector(key: str) -> str:
 
 
 def explain(row: dict) -> str:
-    by = ", ".join(f"{x['person']} (ชอบร่วม {x['shared']})" for x in row["recommended_by"])
-    return f"แนะนำจาก {row['voters']} คนที่รสนิยมคล้ายกัน: {by} · มีคนชอบทั้งหมด {row['popularity']} คน"
+    parts = []
+    if row["friend_votes"]:
+        parts.append(f"เพื่อน {row['friend_votes']} คนชอบ: {', '.join(row['friends'])}")
+    if row["similar_voters"]:
+        parts.append(f"คนรสนิยมคล้ายกัน {row['similar_voters']} คนชอบ: {', '.join(row['similar_names'])}")
+    parts.append(f"มีคนชอบทั้งหมด {row['popularity']} คน")
+    return " · ".join(parts)
 
 
 require_connection()
@@ -79,9 +86,9 @@ require_connection()
 with st.sidebar:
     st.markdown("## 🏨 Hotel Recommender")
     st.caption("Neo4j Aura + Streamlit")
-    page = st.radio("เมนู", ["Dashboard", "Recommendations", "Like / Unlike", "Graph Explorer", "Admin / Setup"])
+    page = st.radio("เมนู", ["Dashboard", "Recommendations", "Like / Unlike", "Friends", "Graph Explorer", "Admin / Setup"])
     st.divider()
-    st.caption("(Person)-[:LIKES]->(Hotel) · Collaborative Filtering")
+    st.caption("LIKES + FRIEND_OF · Collaborative Filtering")
 
 st.markdown(
     """
@@ -96,10 +103,11 @@ st.markdown(
 # ------------------------------------------------------------------ Dashboard
 if page == "Dashboard":
     m = get_metrics()
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Persons", m["persons"])
     c2.metric("Hotels", m["hotels"])
-    c3.metric("LIKES relationships", m["likes"])
+    c3.metric("LIKES", m["likes"])
+    c4.metric("Friendships", m["friendships"])
 
     st.divider()
     left, right = st.columns([3, 2])
@@ -115,6 +123,8 @@ if page == "Dashboard":
         person = person_selector("dash_person")
         liked = get_liked(person)
         st.write("**ชอบ:** " + (", ".join(liked) if liked else "ยังไม่มี"))
+        friends = get_friends(person)
+        st.write("**เพื่อน:** " + (", ".join(friends) if friends else "ยังไม่มี"))
         sims = similar_people(person)
         if sims:
             df = pd.DataFrame(sims)
@@ -128,18 +138,24 @@ if page == "Dashboard":
 elif page == "Recommendations":
     st.subheader("✨ โรงแรมที่แนะนำ")
     person = person_selector("rec_person")
-    top_n = st.slider("จำนวนคำแนะนำ", 1, 10, 5)
+    c1, c2, c3 = st.columns(3)
+    top_n = c1.slider("จำนวนคำแนะนำ", 1, 10, 5)
+    friend_w = c2.slider("น้ำหนักเพื่อน", 0.0, 5.0, 3.0, 0.5)
+    sim_w = c3.slider("น้ำหนักรสนิยมคล้ายกัน", 0.0, 5.0, 1.0, 0.5)
     liked = get_liked(person)
     st.write(f"**{person} ชอบ:** " + (", ".join(liked) if liked else "ยังไม่มี"))
 
-    rows = recommend_hotels(person, top_n)
+    friends = get_friends(person)
+    st.write(f"**เพื่อน:** " + (", ".join(friends) if friends else "ยังไม่มี"))
+
+    rows = recommend_hotels(person, top_n, friend_w, sim_w)
     if rows:
-        st.caption("score = ผลรวมจำนวนโรงแรมที่ชอบร่วมกันของผู้ใช้ที่แนะนำโรงแรมนั้น")
+        st.caption("score = (จำนวนเพื่อนที่ชอบ × น้ำหนักเพื่อน) + (คะแนนความชอบร่วมกับคนคล้ายกัน × น้ำหนักรสนิยม)")
         for i, r in enumerate(rows, start=1):
             st.markdown(
                 f"""
                 <div class="card">
-                  <span class="pill">#{i} · score {r['score']}</span>
+                  <span class="pill">#{i} · score {r['score']:.1f}</span>
                   <h3 style="margin:.55rem 0 .2rem 0">{html.escape(r['hotel'])}</h3>
                   <p class="muted">{html.escape(explain(r))}</p>
                 </div>
@@ -166,6 +182,24 @@ elif page == "Like / Unlike":
         st.success(f"บันทึก LIKES ของ {person} แล้ว ({len(chosen)} แห่ง)")
         st.rerun()
 
+# ------------------------------------------------------------------ Friends
+elif page == "Friends":
+    st.subheader("🤝 จัดการเพื่อน")
+    st.caption("เพื่อนเป็นแบบสองทาง ถ้าเพื่อนชอบโรงแรมไหน ระบบจะดันโรงแรมนั้นให้เรา")
+    person = person_selector("friend_person")
+    others = [p for p in get_people() if p != person]
+    current = get_friends(person)
+    chosen = st.multiselect("เพื่อนของ " + person, others, default=current, key=f"friends_{person}")
+    if st.button("บันทึกเพื่อน", type="primary", width="stretch"):
+        set_friends(person, chosen)
+        st.success(f"บันทึกเพื่อนของ {person} แล้ว ({len(chosen)} คน)")
+        st.rerun()
+    if current:
+        st.markdown("**โรงแรมที่เพื่อนชอบ**")
+        for f in current:
+            liked_f = get_liked(f)
+            st.write(f"- {f}: " + (", ".join(liked_f) if liked_f else "ยังไม่มี"))
+
 # ------------------------------------------------------------------ Graph Explorer
 elif page == "Graph Explorer":
     st.subheader("🕸️ Graph Explorer")
@@ -176,16 +210,19 @@ elif page == "Graph Explorer":
     else:
         recs = {r["hotel"] for r in recommend_hotels(person, 10)}
         mine = {e["hotel"] for e in edges if e["person"] == person}
-        st.caption("ส้ม = ผู้ใช้เป้าหมาย · เขียว = โรงแรมที่แนะนำ · ฟ้า = โรงแรมที่ผู้ใช้เป้าหมายชอบ")
+        friends = set(get_friends(person))
+        st.caption("ส้ม = ผู้ใช้เป้าหมาย · ม่วง = เพื่อน (เส้นประ) · เขียว = โรงแรมที่แนะนำ · ฟ้า = โรงแรมที่ผู้ใช้เป้าหมายชอบ")
         dot = ["digraph G {", "rankdir=LR;", 'node [fontname="Helvetica", style=filled];']
-        for p in sorted({e["person"] for e in edges}):
-            color = "#fbbf24" if p == person else "#bfdbfe"
+        for p in sorted({e["person"] for e in edges} | friends | {person}):
+            color = "#fbbf24" if p == person else ("#e9d5ff" if p in friends else "#bfdbfe")
             dot.append(f'"{p}" [shape=ellipse, fillcolor="{color}"];')
         for h in sorted({e["hotel"] for e in edges}):
             color = "#86efac" if h in recs else ("#93c5fd" if h in mine else "#e5e7eb")
             dot.append(f'"{h}" [shape=box, fillcolor="{color}"];')
         for e in edges:
             dot.append(f'"{e["person"]}" -> "{e["hotel"]}" [label="LIKES", fontsize=9];')
+        for fr in sorted(friends):
+            dot.append(f'"{person}" -> "{fr}" [label="FRIEND_OF", style=dashed, color="#7c3aed", fontsize=9, dir=none];')
         dot.append("}")
         st.graphviz_chart("\n".join(dot), width="stretch")
         with st.expander("ข้อมูล edge"):
@@ -196,7 +233,10 @@ elif page == "Admin / Setup":
     st.subheader("⚙️ Setup")
     st.markdown(
         """
-        **Graph schema:** `(:Person {name})-[:LIKES]->(:Hotel {name})`
+        **Graph schema:**
+
+        - `(:Person {name})-[:LIKES]->(:Hotel {name})`
+        - `(:Person)-[:FRIEND_OF]-(:Person)`
         """
     )
     st.warning("ปุ่มสร้างข้อมูลตัวอย่างใช้ MERGE จึงกดซ้ำได้และไม่ลบข้อมูลเดิม")

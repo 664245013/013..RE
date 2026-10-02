@@ -21,21 +21,39 @@ LIKES = [  # ข้อมูลตัวอย่าง แก้ได้
     ["Nava", "Hotel D"], ["Nava", "Hotel E"], ["Nava", "Hotel I"],
 ]
 
-# Collaborative Filtering: คนที่ชอบโรงแรมร่วมกัน -> โรงแรมอื่นที่เขาชอบ -> ตัดที่เราชอบแล้ว
+FRIENDS = [  # ข้อมูลตัวอย่าง (เพื่อนเป็นแบบสองทาง เก็บทิศเดียว)
+    ["Pond", "Mark"], ["Pond", "Top"], ["Pond", "Yo"],
+    ["U", "Mark"], ["U", "JDK"],
+    ["Bonus", "Poom"], ["Bonus", "Yo"],
+    ["Phat", "Top"], ["Phat", "Nava"], ["Poom", "Nava"],
+]
+
+# Hybrid recommendation:
+#   score = (จำนวนเพื่อนที่ชอบ x friend_weight) + (คะแนน Collaborative Filtering x sim_weight)
+#   - เพื่อน: (t)-[:FRIEND_OF]-(f)-[:LIKES]->(rec)
+#   - CF: ผู้ใช้ที่ชอบโรงแรมร่วมกับ t -> นับ 1 ต่อโรงแรมที่ชอบร่วมกัน
 RECOMMEND_CYPHER = """
-MATCH (t:Person {name: $name})-[:LIKES]->(common:Hotel)<-[:LIKES]-(o:Person)
-WHERE o <> t
-WITH t, o, count(common) AS shared
-MATCH (o)-[:LIKES]->(rec:Hotel)
+MATCH (t:Person {name: $name})
+MATCH (rec:Hotel)
 WHERE NOT (t)-[:LIKES]->(rec)
-WITH rec,
-     count(DISTINCT o) AS voters,
-     sum(shared) AS score,
-     collect(DISTINCT {person: o.name, shared: shared}) AS recommended_by
-RETURN rec.name AS hotel, voters, score,
-       COUNT { (rec)<-[:LIKES]-() } AS popularity,
-       recommended_by
-ORDER BY score DESC, voters DESC, popularity DESC, hotel
+
+OPTIONAL MATCH (t)-[:FRIEND_OF]-(f:Person)-[:LIKES]->(rec)
+WITH t, rec, count(DISTINCT f) AS friend_votes, collect(DISTINCT f.name) AS friends
+
+OPTIONAL MATCH (t)-[:LIKES]->(c:Hotel)<-[:LIKES]-(o:Person)-[:LIKES]->(rec)
+WHERE o <> t
+WITH rec, friend_votes, friends,
+     count(c) AS cf_score,
+     count(DISTINCT o) AS similar_voters,
+     collect(DISTINCT o.name) AS similar_names
+
+WITH rec, friend_votes, friends, cf_score, similar_voters, similar_names,
+     friend_votes * $friend_weight + cf_score * $sim_weight AS score
+WHERE score > 0
+RETURN rec.name AS hotel, score, friend_votes, friends,
+       cf_score, similar_voters, similar_names,
+       COUNT { (rec)<-[:LIKES]-() } AS popularity
+ORDER BY score DESC, friend_votes DESC, popularity DESC, hotel
 LIMIT $limit
 """
 
@@ -93,6 +111,16 @@ def seed_demo_data() -> None:
         {"rows": LIKES},
         write=True,
     )
+    query(
+        """
+        UNWIND $rows AS row
+        MATCH (a:Person {name: row[0]}), (b:Person {name: row[1]})
+        WHERE NOT (a)-[:FRIEND_OF]-(b)
+        CREATE (a)-[:FRIEND_OF]->(b)
+        """,
+        {"rows": FRIENDS},
+        write=True,
+    )
 
 
 def clear_graph_data() -> None:
@@ -122,10 +150,11 @@ def get_metrics() -> dict[str, int]:
         """
         RETURN COUNT { (:Person) } AS persons,
                COUNT { (:Hotel) } AS hotels,
-               COUNT { (:Person)-[:LIKES]->(:Hotel) } AS likes
+               COUNT { (:Person)-[:LIKES]->(:Hotel) } AS likes,
+               COUNT { (:Person)-[:FRIEND_OF]->(:Person) } AS friendships
         """
     )
-    return rows[0] if rows else {"persons": 0, "hotels": 0, "likes": 0}
+    return rows[0] if rows else {"persons": 0, "hotels": 0, "likes": 0, "friendships": 0}
 
 
 def top_hotels(limit: int = 10) -> list[dict[str, Any]]:
@@ -164,10 +193,16 @@ def similar_people(name: str, limit: int = 10) -> list[dict[str, Any]]:
     return rows
 
 
-def recommend_hotels(name: str, limit: int = 5) -> list[dict[str, Any]]:
-    rows = query(RECOMMEND_CYPHER, {"name": name, "limit": int(limit)})
+def recommend_hotels(
+    name: str, limit: int = 5, friend_weight: float = 3.0, sim_weight: float = 1.0
+) -> list[dict[str, Any]]:
+    rows = query(
+        RECOMMEND_CYPHER,
+        {"name": name, "limit": int(limit), "friend_weight": float(friend_weight), "sim_weight": float(sim_weight)},
+    )
     for r in rows:
-        r["recommended_by"] = sorted(r["recommended_by"], key=lambda x: (-x["shared"], x["person"]))
+        r["friends"] = sorted(r["friends"])
+        r["similar_names"] = sorted(r["similar_names"])
     return rows
 
 
@@ -186,19 +221,29 @@ def popular_fallback(name: str, limit: int = 5) -> list[dict[str, Any]]:
 
 
 def graph_edges(name: str) -> list[dict[str, Any]]:
-    """LIKES ของผู้ใช้เป้าหมาย + ของผู้ใช้ที่คล้ายกัน (ใช้วาดกราฟ)"""
+    """LIKES ของผู้ใช้เป้าหมาย + ผู้ใช้ที่คล้ายกัน + เพื่อน (ใช้วาดกราฟ)"""
     return query(
         """
         MATCH (t:Person {name: $name})
         OPTIONAL MATCH (t)-[:LIKES]->(:Hotel)<-[:LIKES]-(o:Person)
         WHERE o <> t
         WITH t, collect(DISTINCT o) AS similar
-        UNWIND ([t] + similar) AS p
+        OPTIONAL MATCH (t)-[:FRIEND_OF]-(f:Person)
+        WITH t, similar, collect(DISTINCT f) AS friends
+        UNWIND ([t] + similar + friends) AS p
         MATCH (p)-[:LIKES]->(h:Hotel)
         RETURN DISTINCT p.name AS person, h.name AS hotel
         """,
         {"name": name},
     )
+
+
+def get_friends(name: str) -> list[str]:
+    rows = query(
+        "MATCH (:Person {name: $name})-[:FRIEND_OF]-(f:Person) RETURN DISTINCT f.name AS friend ORDER BY friend",
+        {"name": name},
+    )
+    return [r["friend"] for r in rows]
 
 
 # ------------------------------------------------------------------ writes
@@ -221,5 +266,29 @@ def set_likes(name: str, hotels: list[str]) -> None:
         MERGE (p)-[:LIKES]->(h)
         """,
         {"name": name, "hotels": hotels},
+        write=True,
+    )
+
+
+def set_friends(name: str, friends: list[str]) -> None:
+    """ซิงค์เพื่อนของผู้ใช้ให้ตรงกับรายการที่เลือก (เพื่อนเป็นแบบสองทาง)"""
+    query(
+        """
+        MATCH (:Person {name: $name})-[r:FRIEND_OF]-(f:Person)
+        WHERE NOT f.name IN $friends
+        DELETE r
+        """,
+        {"name": name, "friends": friends},
+        write=True,
+    )
+    query(
+        """
+        MATCH (p:Person {name: $name})
+        UNWIND $friends AS fn
+        MATCH (f:Person {name: fn})
+        WHERE f <> p AND NOT (p)-[:FRIEND_OF]-(f)
+        CREATE (p)-[:FRIEND_OF]->(f)
+        """,
+        {"name": name, "friends": friends},
         write=True,
     )
