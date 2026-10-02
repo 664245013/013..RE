@@ -184,12 +184,12 @@ photo_path = Path(__file__).resolve().parent.parent / "assets" / "9.jpg"
 try:
     photo_b64 = base64.b64encode(photo_path.read_bytes()).decode()
     st.markdown(
-        f'<div class="profile-photo-wrap"><img src="data:image/jpeg;base64,{photo_b64}" alt="Profile Photo"></div>',
+        f'<div class="profile-photo-wrap"><img src="data:image/jpeg;9,{photo_b64}" alt="Profile Photo"></div>',
         unsafe_allow_html=True,
     )
 except FileNotFoundError:
     st.markdown(
-        '<div class="profile-photo-wrap"><div style="width:200px;height:200px;border-radius:50%;background:#1E293B;border:3px solid #818CF8;display:flex;align-items:center;justify-content:center;font-size:4rem;">🧑‍💻</div></div>',
+        '<div class="profile-photo-wrap"><div style="width:200px;height:200px;border-radius:50%;background:#1E293B;border:3px solid #818CF8;display:flex;align-items:center;justify-content:center;font-size:4rem;"></div></div>',
         unsafe_allow_html=True,
     )
 
