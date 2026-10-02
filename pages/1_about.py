@@ -180,7 +180,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # โหลดรูปภาพ (ตรวจสอบให้แน่ใจว่าไฟล์ assets/1.jpg มีอยู่จริง)
-photo_path = Path(__file__).resolve().parent.parent / "assets" / "1.jpg"
+photo_path = Path(__file__).resolve().parent.parent / "assets" / "9.jpg"
 try:
     photo_b64 = base64.b64encode(photo_path.read_bytes()).decode()
     st.markdown(
